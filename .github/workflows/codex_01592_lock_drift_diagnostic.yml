@@ -1,0 +1,161 @@
+# Public upstream source only. DIAGNOSTIC, NEVER vendor/upload/compile.
+name: Codex Rust 0.159.2 Cargo.lock drift diagnosis (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      approval:
+        description: 'Type APPROVE_PUBLIC_CODEX_LOCK_DIAGNOSTIC'
+        required: true
+        type: string
+        default: 'NOT_APPROVED'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-01592-lock-drift-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  lock_drift:
+    if: ${{ inputs.approval == 'APPROVE_PUBLIC_CODEX_LOCK_DIAGNOSTIC' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout pinned public upstream without credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: openai/codex
+          ref: ff6aec96948b70d94983af2641a6b67c94faeff5
+          fetch-depth: 1
+          persist-credentials: false
+          path: upstream
+
+      - name: Verify original source and locked Git dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = 'ff6aec96948b70d94983af2641a6b67c94faeff5'
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import tomllib
+          import urllib.parse
+          root = pathlib.Path('upstream/codex-rs')
+          lockfile = root / 'Cargo.lock'
+          expected = '4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e'
+          assert hashlib.sha256(lockfile.read_bytes()).hexdigest() == expected, 'STOP: original Cargo.lock mismatch'
+          assert tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel'] == '1.95.0'
+          packages = tomllib.loads(lockfile.read_text())['package']
+          registry = [p for p in packages if p.get('source', '').startswith('registry+')]
+          git = [p for p in packages if p.get('source', '').startswith('git+')]
+          assert len(registry) == 1297 and len(git) == 16
+          assert all(len(p.get('checksum', '')) == 64 for p in registry)
+          allow = {
+              'microsoft/mxc',
+              'openai-oss-forks/crossterm',
+              'hyperium/h3',
+              'helix-editor/nucleo.git',
+              'dzbarsky/rules_rust',
+              'openai-oss-forks/tokio-tungstenite',
+              'openai-oss-forks/tungstenite-rs',
+          }
+          found = set()
+          for package in git:
+              raw, delim, commit = package['source'][4:].partition('#')
+              assert delim == '#' and len(commit) == 40
+              u = urllib.parse.urlsplit(raw)
+              assert u.scheme == 'https' and u.netloc == 'github.com'
+              repo = u.path.lstrip('/')
+              assert repo in allow, f'STOP: non-allowlisted source {repo}'
+              assert urllib.parse.parse_qs(u.query).get('rev') == [commit]
+              found.add(repo)
+          assert found == allow
+          print('PINNED_PUBLIC_INPUT_CHECK=PASS')
+          PY
+
+      - name: Install Rust 1.95.0 on temporary runner
+        shell: bash
+        env:
+          RUSTUP_HOME: ${{ runner.temp }}/codex-01592-diag-rustup
+          CARGO_HOME: ${{ runner.temp }}/codex-01592-diag-rustup-cargo
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUSTUP_HOME" "$CARGO_HOME"
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup run 1.95.0 cargo --version | grep -F 'cargo 1.95.0 '
+
+      - name: Diagnose Cargo resolution in disposable public-source copy only
+        shell: bash
+        env:
+          RUSTUP_HOME: ${{ runner.temp }}/codex-01592-diag-rustup
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/codex-01592-lock-diagnostic"
+          mkdir -p "$base/source" "$base/home" "$base/cargo-home" "$base/tmp"
+          cp -a "$GITHUB_WORKSPACE/upstream/codex-rs/." "$base/source/"
+          expected='4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e'
+          test "$(sha256sum "$base/source/Cargo.lock" | cut -d' ' -f1)" = "$expected"
+          cd "$base/source"
+          echo 'DIAGNOSTIC_ONLY: cargo metadata may change the TEMPORARY copy of Cargo.lock'
+          if /usr/bin/env -i \
+            HOME="$base/home" CARGO_HOME="$base/cargo-home" RUSTUP_HOME="$RUSTUP_HOME" \
+            TMPDIR="$base/tmp" PATH="$PATH" \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            GIT_TERMINAL_PROMPT=0 CARGO_NET_RETRY=0 \
+            CARGO_NET_GIT_FETCH_WITH_CLI=false MALLOC_CONF= \
+            rustup run 1.95.0 cargo metadata --format-version=1 \
+              --manifest-path "$base/source/Cargo.toml" \
+              >"$base/metadata.json" 2>"$base/metadata.stderr.log"; then
+            metadata_rc=0
+          else
+            metadata_rc=$?
+          fi
+          python3 - "$GITHUB_WORKSPACE/upstream/codex-rs/Cargo.lock" \
+            "$base/source/Cargo.lock" "$base/metadata.stderr.log" "$metadata_rc" <<'PY'
+          import hashlib
+          import pathlib
+          import re
+          import sys
+          import tomllib
+          original, temporary, errorlog = map(pathlib.Path, sys.argv[1:4])
+          code = int(sys.argv[4])
+          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          expected = '4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e'
+          assert digest(original) == expected, 'STOP: original lockfile changed'
+          print('ORIGINAL_LOCKFILE_SHA256=PASS')
+          print('METADATA_EXIT=' + str(code))
+          print('TEMP_LOCK_SHA256=' + digest(temporary))
+          old = tomllib.loads(original.read_text())['package']
+          new = tomllib.loads(temporary.read_text())['package']
+          def key(p):
+              return (p['name'], p['version'], p.get('source', ''))
+          old_by_key = {key(p): p for p in old}
+          new_by_key = {key(p): p for p in new}
+          added = sorted(new_by_key.keys() - old_by_key.keys())
+          removed = sorted(old_by_key.keys() - new_by_key.keys())
+          changed = sorted(k for k in new_by_key.keys() & old_by_key.keys() if new_by_key[k] != old_by_key[k])
+          print('ORIGINAL_PACKAGE_COUNT=' + str(len(old)))
+          print('TEMP_PACKAGE_COUNT=' + str(len(new)))
+          print('ADDED=' + str(len(added)) + ' REMOVED=' + str(len(removed)) + ' MODIFIED=' + str(len(changed)))
+          for label, collection in [('ADDED', added), ('REMOVED', removed), ('MODIFIED', changed)]:
+              for item in collection[:40]:
+                  print(label + ': ' + item[0] + ' ' + item[1] + ' (' + item[2][:120] + ')')
+          print('CARGO_STDERR_LAST_60_LINES:')
+          for line in errorlog.read_text(errors='replace').splitlines()[-60:]:
+              line = re.sub(r'(?i)(https?://)[^/@\s]+@', r'\1[REDACTED]@', line)
+              line = re.sub(r'(?i)\b(authorization|token|password|secret|api_key)\b\s*[:=]\s*\S+', r'\1=[REDACTED]', line)
+              print(line[:700])
+          print('VENDOR_EXECUTION=NOT_RUN')
+          print('UPLOADED_ARTIFACTS=NONE')
+          print('LOCAL_BUILD=NOT_RUN')
+          PY
+          test "$(sha256sum "$GITHUB_WORKSPACE/upstream/codex-rs/Cargo.lock" | cut -d' ' -f1)" = "$expected"
+          if [ "$metadata_rc" -ne 0 ]; then
+            echo "::error::Disposable Cargo metadata diagnostics failed (exit $metadata_rc)"
+            exit "$metadata_rc"
+          fi
+          echo 'DIAGNOSTIC_COMPLETED; ORIGINAL_LOCK_UNCHANGED; VENDOR_NOT_RUN'
