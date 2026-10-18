@@ -113,7 +113,7 @@ jobs:
           mkdir -p "$acq/cargo-home" "$acq/temporary-home/tmp" "$acq/logs" "$acq/output"
           test ! -e "$acq/vendor" || { echo 'STOP: vendor destination exists' >&2; exit 1; }
           cd "$GITHUB_WORKSPACE/upstream/codex-rs"
-          /usr/bin/env -i \
+          if /usr/bin/env -i \
             HOME="$HOME" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
             TMPDIR="$acq/temporary-home/tmp" PATH="$PATH" \
             GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
@@ -124,7 +124,27 @@ jobs:
               --manifest-path "$GITHUB_WORKSPACE/upstream/codex-rs/Cargo.toml" \
               "$acq/vendor" \
               >"$acq/logs/vendor-config.stdout.toml" \
-              2>"$acq/logs/vendor.stderr.log"
+              2>"$acq/logs/vendor.stderr.log"; then
+            echo 'CARGO_VENDOR_EXIT=0'
+          else
+            vendor_exit=$?
+            echo "::error::cargo vendor failed with exit code $vendor_exit"
+            echo '::group::Redacted Cargo stderr (last 120 lines)'
+            python3 - "$acq/logs/vendor.stderr.log" <<'PY'
+          import pathlib
+          import re
+          import sys
+          logfile = pathlib.Path(sys.argv[1])
+          lines = logfile.read_text(encoding="utf-8", errors="replace").splitlines()
+          print(f"DIAGNOSTIC_LINES_TOTAL={len(lines)}")
+          for line in lines[-120:]:
+              line = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[REDACTED]@", line)
+              line = re.sub(r"(?i)\b(authorization|token|password|secret|api_key)\b\s*[:=]\s*\S+", r"\1=[REDACTED]", line)
+              print(line[:1000])
+          PY
+            echo '::endgroup::'
+            exit "$vendor_exit"
+          fi
           test -d "$acq/vendor"
           test -s "$acq/logs/vendor-config.stdout.toml"
           sha256sum "$GITHUB_WORKSPACE/upstream/codex-rs/Cargo.lock"
