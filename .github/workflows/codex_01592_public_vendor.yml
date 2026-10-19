@@ -101,6 +101,78 @@ jobs:
           rustup run 1.95.0 rustc --version | grep -F 'rustc 1.95.0 '
           rustup run 1.95.0 cargo --version | grep -F 'cargo 1.95.0 '
 
+      - name: Normalize only workspace package versions in disposable public-source copy
+        shell: bash
+        env:
+          RUSTUP_HOME: ${{ runner.temp }}/codex-01592-rustup-home
+        run: |
+          set -euo pipefail
+          acq="$RUNNER_TEMP/codex-01592-acq"
+          mkdir -p "$acq/cargo-home" "$acq/temporary-home/tmp" "$acq/logs" "$acq/output"
+          test ! -e "$acq/source" || { echo 'STOP: disposable source directory already exists' >&2; exit 1; }
+          cp -a "$GITHUB_WORKSPACE/upstream/codex-rs" "$acq/source"
+          original="$GITHUB_WORKSPACE/upstream/codex-rs/Cargo.lock"
+          expected='4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e'
+          test "$(sha256sum "$original" | cut -d' ' -f1)" = "$expected"
+          test "$(sha256sum "$acq/source/Cargo.lock" | cut -d' ' -f1)" = "$expected"
+          cd "$acq/source"
+          if /usr/bin/env -i \
+            HOME="$acq/temporary-home" CARGO_HOME="$acq/cargo-home" RUSTUP_HOME="$RUSTUP_HOME" \
+            TMPDIR="$acq/temporary-home/tmp" PATH="$PATH" \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            GIT_TERMINAL_PROMPT=0 CARGO_NET_RETRY=0 \
+            CARGO_NET_GIT_FETCH_WITH_CLI=false MALLOC_CONF= \
+            rustup run 1.95.0 cargo metadata --format-version=1 \
+              --manifest-path "$acq/source/Cargo.toml" \
+              >"$acq/logs/metadata.json" 2>"$acq/logs/metadata.stderr.log"; then
+            echo 'DISPOSABLE_METADATA_EXIT=0'
+          else
+            rc=$?
+            echo "::error::Disposable workspace metadata failed with exit code $rc; no vendor attempted"
+            exit "$rc"
+          fi
+          python3 - "$original" "$acq/source/Cargo.lock" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          import tomllib
+          original, temporary = (pathlib.Path(p) for p in sys.argv[1:])
+          sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          expected = '4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e'
+          assert sha(original) == expected, 'STOP: original Cargo.lock mismatch'
+          old = tomllib.loads(original.read_text(encoding='utf-8'))
+          new = tomllib.loads(temporary.read_text(encoding='utf-8'))
+          assert set(old) == set(new), 'STOP: top-level Cargo.lock keys changed'
+          assert all(old[k] == new[k] for k in old if k != 'package'), 'STOP: Cargo.lock non-package data changed'
+          a, b = old['package'], new['package']
+          assert len(a) == len(b) == 1472, 'STOP: package count drift'
+          ext_a = [p for p in a if 'source' in p]
+          ext_b = [p for p in b if 'source' in p]
+          internal_a = [p for p in a if 'source' not in p]
+          internal_b = [p for p in b if 'source' not in p]
+          assert len(ext_a) == len(ext_b) == 1313, 'STOP: external dependency count drift'
+          assert len(internal_a) == len(internal_b) == 159, 'STOP: workspace dependency count drift'
+          ordered = lambda items: sorted(items, key=lambda p: (p['name'], p['version'], p.get('source', '')))
+          assert ordered(ext_a) == ordered(ext_b), 'STOP: external registry/Git dependencies changed'
+          old_map = {p['name']: p for p in internal_a}
+          new_map = {p['name']: p for p in internal_b}
+          assert len(old_map) == len(new_map) == 159, 'STOP: duplicate internal package names'
+          assert old_map.keys() == new_map.keys(), 'STOP: internal package names changed'
+          for name, before in old_map.items():
+              after = new_map[name]
+              assert before['version'] == '0.0.0', f'STOP: unexpected old workspace version: {name}'
+              assert after['version'] == '0.159.2', f'STOP: unexpected new workspace version: {name}'
+              assert {k: v for k, v in before.items() if k != 'version'} == {
+                  k: v for k, v in after.items() if k != 'version'
+              }, f'STOP: non-version fields changed: {name}'
+          print('LOCK_RECONCILIATION=PASS; ONLY_159_INTERNAL_VERSIONS_0.0.0_TO_0.159.2')
+          print('EXTERNAL_PACKAGES_UNCHANGED=1313')
+          print('ORIGINAL_LOCK_SHA256=' + sha(original))
+          print('DISPOSABLE_LOCK_SHA256=' + sha(temporary))
+          PY
+          sha256sum "$acq/source/Cargo.lock" > "$acq/logs/normalized-lock-sha256.txt"
+          test "$(sha256sum "$original" | cut -d' ' -f1)" = "$expected"
+
       - name: Vendor public dependencies only (no build or test)
         shell: bash
         env:
@@ -112,7 +184,8 @@ jobs:
           acq="$RUNNER_TEMP/codex-01592-acq"
           mkdir -p "$acq/cargo-home" "$acq/temporary-home/tmp" "$acq/logs" "$acq/output"
           test ! -e "$acq/vendor" || { echo 'STOP: vendor destination exists' >&2; exit 1; }
-          cd "$GITHUB_WORKSPACE/upstream/codex-rs"
+          test -s "$acq/logs/normalized-lock-sha256.txt" || { echo 'STOP: normalized lock receipt missing' >&2; exit 1; }
+          cd "$acq/source"
           if /usr/bin/env -i \
             HOME="$HOME" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
             TMPDIR="$acq/temporary-home/tmp" PATH="$PATH" \
@@ -121,7 +194,7 @@ jobs:
             CARGO_NET_GIT_FETCH_WITH_CLI=false MALLOC_CONF= \
             rustup run 1.95.0 cargo vendor \
               --locked --versioned-dirs \
-              --manifest-path "$GITHUB_WORKSPACE/upstream/codex-rs/Cargo.toml" \
+              --manifest-path "$acq/source/Cargo.toml" \
               "$acq/vendor" \
               >"$acq/logs/vendor-config.stdout.toml" \
               2>"$acq/logs/vendor.stderr.log"; then
@@ -147,10 +220,12 @@ jobs:
           fi
           test -d "$acq/vendor"
           test -s "$acq/logs/vendor-config.stdout.toml"
-          sha256sum "$GITHUB_WORKSPACE/upstream/codex-rs/Cargo.lock"
-          test "$(sha256sum "$GITHUB_WORKSPACE/upstream/codex-rs/Cargo.lock" | cut -d' ' -f1)" = \
+          original="$GITHUB_WORKSPACE/upstream/codex-rs/Cargo.lock"
+          test "$(sha256sum "$original" | cut -d' ' -f1)" = \
             '4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e'
-          echo 'VENDOR_COMMAND_EXIT=0; LOCK_UNCHANGED=PASS'
+          normalized="$(cut -d' ' -f1 "$acq/logs/normalized-lock-sha256.txt")"
+          test "$(sha256sum "$acq/source/Cargo.lock" | cut -d' ' -f1)" = "$normalized"
+          echo 'VENDOR_COMMAND_EXIT=0; ORIGINAL_LOCK_UNCHANGED=PASS; NORMALIZED_LOCK_UNCHANGED=PASS'
 
       - name: Package immutable source bundle and summarize size
         shell: bash
@@ -160,6 +235,7 @@ jobs:
           bundle="$acq/output/vendor-sources.tar.gz"
           tar -C "$acq" -czf "$bundle" vendor
           cp "$acq/logs/vendor-config.stdout.toml" "$acq/output/vendor-config.stdout.toml"
+          cp "$acq/logs/normalized-lock-sha256.txt" "$acq/output/normalized-lock-sha256.txt"
           printf '%s\n' 'ff6aec96948b70d94983af2641a6b67c94faeff5' > "$acq/output/upstream-commit.txt"
           printf '%s\n' '4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e' > "$acq/output/cargo-lock-sha256.txt"
           (cd "$acq/output" && sha256sum vendor-sources.tar.gz > vendor-sources.tar.gz.sha256)
@@ -169,6 +245,7 @@ jobs:
             echo 'Source commit: `ff6aec96948b70d94983af2641a6b67c94faeff5`'
             echo 'Lockfile SHA-256: `4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e`'
             echo "Source bundle bytes: $bytes"
+            echo 'Original Cargo.lock remained unchanged. Disposable workspace-only version reconciliation passed.'
             echo 'Offline build, macOS compatibility, and local runtime: NOT_VERIFIED'
           } >> "$GITHUB_STEP_SUMMARY"
           max_bytes=$((400 * 1024 * 1024))
